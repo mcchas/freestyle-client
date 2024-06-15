@@ -1,4 +1,5 @@
 import EventEmitter from "events";
+import { fetch as undiciFetch, Agent } from 'undici'
 import { CognitoClient, Session } from "./lib/cognito-client";
 import * as Constants from "./constants";
 import {
@@ -13,16 +14,17 @@ class PubEmitter extends EventEmitter { };
 export default class Freestyle {
     private username: string;
     private password: string;
-    private session?: Session;
+    public session?: Session;
     private client: CognitoClient;
     private timer?: NodeJS.Timeout;
-    private lock?: Lock;
+    public lock?: Lock;
     private home?: Home;
     private userPoolId: string = Constants.userPoolId;
     private userPoolClientId: string = Constants.userPoolClientId;
     private property?: Property;
     private emitter: PubEmitter;
-    public watchFrequency: number = 10000;
+    public watchFrequency: number = 25000;
+    private agent: Agent;
 
     constructor(username: string, password: string) {
         this.username = username;
@@ -33,6 +35,11 @@ export default class Freestyle {
             clientSecret: Constants.clientSecret,
         })
         this.emitter = new PubEmitter();
+        this.agent = new Agent({
+            pipelining: 1,
+            keepAliveTimeout: 30,
+            keepAliveMaxTimeout: 600,
+        })
     }
 
     async authenticate() {
@@ -46,38 +53,48 @@ export default class Freestyle {
         this.session = await this.client.refreshSession(this.session.refreshToken);
     }
 
-    async watch() {
-        if (!this.timer) {
-            this.timer = setInterval(async () => {
-                if (!this.session || !this.lock) {
-                    throw new Error('Missing session');
-                }
-                const lastLock = Object.assign({}, this.lock);
-                await this.getHome();
-                
-                const changes = lockDiff(lastLock, this.lock);
-                if (changes.length > 0) {
-                    this.emitter.emit('change', {
-                        previous: lastLock,
-                        changes: changes
-                    });
-                    changes.forEach((property: any) => {
-                        const key = Object.keys(property)[0];
-                        this.emitter.emit(key, property[key]);
-                    })
-                }
-
-
-                // check session expiry
-                const timeNow = new Date().getTime();
-                if (timeNow > (this.session.expiresIn - 60000 - this.watchFrequency)) {
-                    console.log('session expired, refreshing');
-                    await this.authRefresh();
-                }
-            }, this.watchFrequency);
+    watch() {
+        if (this.timer) {
+            throw new Error("watch already running");
         }
-        else {
-            console.log("watch already running");
+        this.timer = setInterval(async () => {
+            await this.poll().catch(e => console.error(e));
+        }, this.watchFrequency);
+    }
+
+    set frequency(interval: number) {
+        this.watchFrequency = interval;
+        if (this.timer) {
+            clearInterval(this.timer);
+            this.timer = undefined;
+            this.watch();
+        }
+    }
+
+    async poll() {
+        if (!this.session || !this.lock) {
+            throw new Error('Missing session');
+        }
+        const lastLock = Object.assign({}, this.lock);
+        await this.getHome();
+
+        const changes = lockDiff(lastLock, this.lock);
+        if (changes.length > 0) {
+            this.emitter.emit('change', {
+                previous: lastLock,
+                changes: changes
+            });
+            changes.forEach((property: any) => {
+                const key = Object.keys(property)[0];
+                this.emitter.emit(key, property[key]);
+            })
+        }
+
+        // check session expiry
+        const timeNow = new Date().getTime();
+        if (timeNow > (this.session.expiresIn - 60000 - this.watchFrequency)) {
+            console.log('session expired, refreshing');
+            await this.authRefresh();
         }
     }
 
@@ -92,8 +109,7 @@ export default class Freestyle {
         if (!this.session) {
             throw new Error('Missing session');
         }
-        const properties: Property[] = await apiGet(
-            this.session,
+        const properties: Property[] = await this.apiGet(
             `${Constants.endpoint}/properties`
         )
         this.property = properties[0];
@@ -104,13 +120,17 @@ export default class Freestyle {
         if (!this.session || !this.property) {
             throw new Error('Missing session');
         }
-        const home: Home = await apiGet(
-            this.session,
+        const home: Home = await this.apiGet(
             `${Constants.endpoint}/properties/${this.property.propertyId}`
         )
         this.home = home;
         this.lock = home.locks[0];
         return this.home;
+    }
+
+    async getHomeCb(callback: Function): Promise<void> {
+        await this.getHome();
+        callback();
     }
 
     printStatus() {
@@ -135,8 +155,7 @@ export default class Freestyle {
         if (!this.session || !this.property || !this.lock) {
             throw new Error('Missing session');
         }
-        await apiPut(
-            this.session,
+        return await this.apiPut(
             `${Constants.endpoint}/properties/${this.property.propertyId}/locks/${this.lock.bleMac}`,
             {
                 desiredLockStateTimeoutSeconds: 12.0,
@@ -152,8 +171,7 @@ export default class Freestyle {
         if (!this.session || !this.property || !this.lock) {
             throw new Error('Missing session');
         }
-        await apiPut(
-            this.session,
+        return await this.apiPut(
             `${Constants.endpoint}/properties/${this.property.propertyId}/locks/${this.lock.bleMac}`,
             {
                 desiredLockStateTimeoutSeconds: 12.0,
@@ -169,9 +187,8 @@ export default class Freestyle {
         if (!this.session || !this.property || !this.lock) {
             throw new Error('Missing session');
         }
-        await apiPut(
-            this.session,
-            `${Constants.endpoint}/v0/properties/${this.property.propertyId}/locks/${this.lock.bleMac}`,
+        return await this.apiPut(
+            `${Constants.endpoint}/properties/${this.property.propertyId}/locks/${this.lock.bleMac}`,
             {
                 desiredLockStateTimeoutSeconds: 12.0,
                 desiredState: LockStates.LOCKED_PRIVACY,
@@ -179,7 +196,55 @@ export default class Freestyle {
                     data: 605271687314696
                 }
             }
-        )
+        );
+    }
+
+    private async apiGet<T>(url: string): Promise<T> {
+        if (!this.session) {
+            throw new Error('Missing session');
+        }
+        const response = await undiciFetch(url, {
+            dispatcher: this.agent,
+            headers: {
+                'authorization': this.session.idToken,
+                'user-agent': 'okhttp/4.9.3'
+            },
+            method: 'GET',
+        });
+
+        if (response && response.status < 300) {
+            return response.json() as T;
+        }
+
+        const body = await response.json();
+        return body as T;
+    }
+
+    private async apiPut<T>(url: string, data: any): Promise<T | undefined> {
+        if (!this.session) {
+            throw new Error('Missing session');
+        }
+
+        const response = await undiciFetch(url, {
+            dispatcher: this.agent,
+            headers: {
+                'authorization': this.session.idToken,
+                'user-agent': 'okhttp/4.9.3'
+            },
+            method: 'PUT',
+            body: JSON.stringify(data)
+        });
+
+        if (response?.status == 204) {
+            return response.status as T;
+        }
+
+        if (response && response.status < 300) {
+            return response.json() as T;
+        }
+
+        const body = await response.json();
+        return body as T;
     }
 
 }
@@ -204,45 +269,4 @@ function lockDiff(a: Lock, b: Lock): Record<string, any> {
     if (a.diagnosticEnabled !== b.diagnosticEnabled) delta.push({ diagnosticEnabled: b.diagnosticEnabled });
     if (a.firmwareVersion !== b.firmwareVersion) delta.push({ firmwareVersion: b.firmwareVersion });
     return delta;
-}
-
-async function apiGet<T>(session: Session, url: string): Promise<T> {
-
-    const response = await fetch(url, {
-        headers: {
-            'authorization': session.idToken,
-            'user-agent': 'okhttp/4.9.3'
-        },
-        method: 'GET',
-    });
-
-    if (response && response.status < 300) {
-        return response.json();
-    }
-
-    const body = await response.json();
-    return body;
-}
-
-async function apiPut<T>(session: Session, url: string, data: any): Promise<T | undefined> {
-
-    const response = await fetch(url, {
-        headers: {
-            'authorization': session.idToken,
-            'user-agent': 'okhttp/4.9.3'
-        },
-        method: 'PUT',
-        body: JSON.stringify(data)
-    });
-
-    if (response?.status == 204) {
-        return;
-    }
-
-    if (response && response.status < 300) {
-        return response.json();
-    }
-
-    const body = await response.json();
-    return body;
 }
