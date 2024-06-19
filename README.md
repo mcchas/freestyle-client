@@ -9,6 +9,9 @@ Cognito user pool, client ID and client secret were retrived from the Android AP
 At this time it only supports the first registered property and first lock for that property (as I only have 1 door).
 
 ## Example
+
+Tested with node v20 (requires crypto).
+
 ```ts
 import Freestyle from "freestyle-client";
 
@@ -31,6 +34,7 @@ Edit the username and password and run with ts-node
 Use this to find your BLE mac address and offline AES key.
 
 ```sh
+nvm use 20
 npm install
 npm i -g ts-node
 ts-node ./example.ts
