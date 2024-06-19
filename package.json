@@ -6,7 +6,8 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "build": "tsc"
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
   },
   "author": "mcchas",
   "license": "MIT",
@@ -15,7 +16,8 @@
     "date-fns": "^2.30.0",
     "date-fns-tz": "^2.0.0",
     "hash.js": "^1.1.7",
-    "jsbn": "^1.1.0"
+    "jsbn": "^1.1.0",
+    "undici": "^5.28.2"
   },
   "devDependencies": {
     "@types/jsbn": "^1.2.33",
